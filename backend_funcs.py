@@ -6,6 +6,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 import skopt
+import FluxFox
 from FluxFox.ameriflux import retrieve_ameriflux
 from FluxFox.postproc import ustar_papale_2006, despike_mad_papale_2006, gapfill_xgb_liu_2025, compute_isday, gpp_night_reichstein_2005
 from FluxFox.postproc.partition import ReichsteinResult
@@ -310,4 +311,82 @@ def plot_data_integrity(
     colorbar.ax.set_yticklabels(_COLORBAR_LABELS)
     return figure
 
-__all__ = ["plot_data_integrity", "load_amf_data"]
+# Run this cell
+# It can take 3-15 minutes to run, depending on the length of the data.
+
+def postprocess(amf, LE_var, FC_var, H_var, P_var, USTAR_var):
+
+    print("Performing Post-Processing and Quality Control Routines. This could take several minutes.")
+
+    rh_cols = amf.data.filter(regex="^RH(_PI|_F|_[0-9]+_1|$)").columns
+    rh_dat = amf.data[rh_cols].mean(1).rename("RH")
+    swc_cols = amf.data.filter(regex="^SWC(_PI|_F|_[0-9]+_1|$)").columns
+    swc_dat = amf.data[swc_cols].mean(1).rename("SWC")
+    swin_cols = amf.data.filter(regex="^SW_IN(_PI|_F|_[0-9]+_1|$)").columns
+    swin_dat = amf.data[swin_cols].mean(1).rename("SW_IN")
+    ta_cols = amf.data.filter(regex="^TA(_PI|_F|_[0-9]+_1|$)").columns
+    ta_dat = amf.data[ta_cols].mean(1).rename("TA")
+    vpd_dat = thermo.compute_e_sat_water(ta_dat, check_inputs=False) * (1 - rh_dat/100)
+    vpd_dat.name = "VPD"
+    lw_cols = amf.data.filter(regex="^LW_OUT").columns
+    lw_dat = amf.data[lw_cols].mean(1).rename("LW_OUT")
+
+    df = amf.data[[LE_var, FC_var, H_var, P_var, USTAR_var]].copy()
+    df = df.rename(columns={LE_var: "LE", FC_var: "NEE", P_var: "P", USTAR_var: "USTAR", H_var:"H"})
+    df["RH"] = rh_dat
+    df["SWC"] = swc_dat
+    df["SW_IN"] = swin_dat
+    df["TA"] = ta_dat
+    df["VPD"] = vpd_dat
+    df["LW_OUT"] = lw_dat
+
+    print("(1/4) Computing sunrise/sunset times...", end="")
+    isday = postproc.compute_isday(df.index, lat=amf.lat, lon=amf.lon, elev=amf.elev)
+    print("Done")
+
+    print("(2/4) Despiking data...", end="")
+    cols_to_despike = ["LE", "NEE", "H", "TA", "SW_IN"]
+    keep = postproc.despike_mad_papale_2006(df, isday, cols_to_despike=cols_to_despike)
+    df.loc[:, cols_to_despike] = df.loc[:, cols_to_despike].where(keep)
+    print("Done")
+
+    print("(3/4) Removing time periods with insufficient wind...", end="")
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ust_res = postproc.ustar_broken_stick(
+            df, isday, 
+            ta_col="TA", ustar_col="USTAR", nee_col="NEE", 
+            seasons=3, n_ta_classes=6, ustar_ta_corr_cutoff=0.4, ustar_thresh_bounds=(0.1, 0.7), n_restarts=10, 
+            loss="mae", gapfill_quantile=0.75, default_ustar_thresh=0.2, pbar=False, random_state=8472
+        )
+    df.loc[:, ["LE", "NEE", "H"]] = df.loc[:, ["LE", "NEE", "H"]].where(ust_res.flag)
+    print("Done")
+
+    print("(4/4) Filling in data gaps (this is the slowest step)...", end="")
+    hyper_train_frac = min(0.2, 17500/df.shape[0])
+    for tgt_col in ["LE", "NEE", "H"]:
+        xgb_res = postproc.gapfill_xgb_liu_2025(
+            df, tgt_col,
+            ta_col="TA", sw_in_col="SW_IN", swc_col="SWC", vpd_col="VPD", extra_predictor_cols=["RH"],
+            n_missing_allowed=1, 
+            hyper_train_frac=min(0.2, 17500/df.shape[0]),
+            hyper_test_frac=min(0.07, min(0.07, 17500/df.shape[0]*0.3)),
+            train_frac = min(0.8, 17500*5/df.shape[0]),
+            n_bayes_iter = 30, cv_folds=5, random_state=8472, verbose=False
+        )
+        print(".", end="")
+        df[tgt_col] = xgb_res.filled
+
+        # mds_res = postproc.gapfill_mds_reichstein_2005(
+        #     df, tgt_col,
+        #     ta_col="TA", sw_in_col="SW_IN", vpd_col="VPD", tol_vpd=50, verbose=False
+        # )
+        # print(".", end="")
+        # df[tgt_col] = mds_res.filled
+    print("Done")
+    print("All post-processing and quality control procedures finished.")
+    df[["WY", "DOWY"]] = FluxFox.utils.compute_WY_DOWY(df.index)
+    return df
+
+__all__ = ["plot_data_integrity", "load_amf_data", "postprocess"]
